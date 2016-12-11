@@ -17,6 +17,7 @@ package embed
 import (
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/coreos/etcd/discovery"
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/pkg/cors"
+	"github.com/coreos/etcd/pkg/netutil"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/ghodss/yaml"
@@ -33,13 +35,12 @@ const (
 	ClusterStateFlagNew      = "new"
 	ClusterStateFlagExisting = "existing"
 
-	DefaultName                     = "default"
-	DefaultInitialAdvertisePeerURLs = "http://localhost:2380"
-	DefaultAdvertiseClientURLs      = "http://localhost:2379"
-	DefaultListenPeerURLs           = "http://localhost:2380"
-	DefaultListenClientURLs         = "http://localhost:2379"
-	DefaultMaxSnapshots             = 5
-	DefaultMaxWALs                  = 5
+	DefaultName         = "default"
+	DefaultMaxSnapshots = 5
+	DefaultMaxWALs      = 5
+
+	DefaultListenPeerURLs   = "http://localhost:2380"
+	DefaultListenClientURLs = "http://localhost:2379"
 
 	// maxElectionMs specifies the maximum value of election timeout.
 	// More details are listed in ../Documentation/tuning.md#time-parameters.
@@ -50,7 +51,25 @@ var (
 	ErrConflictBootstrapFlags = fmt.Errorf("multiple discovery or bootstrap flags are set. " +
 		"Choose one of \"initial-cluster\", \"discovery\" or \"discovery-srv\"")
 	ErrUnsetAdvertiseClientURLsFlag = fmt.Errorf("--advertise-client-urls is required when --listen-client-urls is set explicitly")
+
+	DefaultInitialAdvertisePeerURLs = "http://localhost:2380"
+	DefaultAdvertiseClientURLs      = "http://localhost:2379"
+
+	defaultHostname   string = "localhost"
+	defaultHostStatus error
 )
+
+func init() {
+	ip, err := netutil.GetDefaultHost()
+	if err != nil {
+		defaultHostStatus = err
+		return
+	}
+	// found default host, advertise on it
+	DefaultInitialAdvertisePeerURLs = "http://" + ip + ":2380"
+	DefaultAdvertiseClientURLs = "http://" + ip + ":2379"
+	defaultHostname = ip
+}
 
 // Config holds the arguments for configuring an etcd server.
 type Config struct {
@@ -160,7 +179,7 @@ func NewConfig() *Config {
 }
 
 func ConfigFromFile(path string) (*Config, error) {
-	cfg := &configYAML{}
+	cfg := &configYAML{Config: *NewConfig()}
 	if err := cfg.configFromFile(path); err != nil {
 		return nil, err
 	}
@@ -236,6 +255,13 @@ func (cfg *configYAML) configFromFile(path string) error {
 }
 
 func (cfg *Config) Validate() error {
+	if err := checkBindURLs(cfg.LPUrls); err != nil {
+		return err
+	}
+	if err := checkBindURLs(cfg.LCUrls); err != nil {
+		return err
+	}
+
 	// Check if conflicting flags are passed.
 	nSet := 0
 	for _, v := range []bool{cfg.Durl != "", cfg.InitialCluster != "", cfg.DNSCluster != ""} {
@@ -317,3 +343,39 @@ func (cfg Config) InitialClusterFromName(name string) (ret string) {
 
 func (cfg Config) IsNewCluster() bool { return cfg.ClusterState == ClusterStateFlagNew }
 func (cfg Config) ElectionTicks() int { return int(cfg.ElectionMs / cfg.TickMs) }
+
+// IsDefaultHost returns the default hostname, if used, and the error, if any,
+// from getting the machine's default host.
+func (cfg Config) IsDefaultHost() (string, error) {
+	if len(cfg.APUrls) == 1 && cfg.APUrls[0].String() == DefaultInitialAdvertisePeerURLs {
+		return defaultHostname, defaultHostStatus
+	}
+	if len(cfg.ACUrls) == 1 && cfg.ACUrls[0].String() == DefaultAdvertiseClientURLs {
+		return defaultHostname, defaultHostStatus
+	}
+	return "", defaultHostStatus
+}
+
+// checkBindURLs returns an error if any URL uses a domain name.
+// TODO: return error in 3.2.0
+func checkBindURLs(urls []url.URL) error {
+	for _, url := range urls {
+		if url.Scheme == "unix" || url.Scheme == "unixs" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(url.Host)
+		if err != nil {
+			return err
+		}
+		if host == "localhost" {
+			// special case for local address
+			// TODO: support /etc/hosts ?
+			continue
+		}
+		if net.ParseIP(host) == nil {
+			err := fmt.Errorf("expected IP in URL for binding (%s)", url.String())
+			plog.Warning(err)
+		}
+	}
+	return nil
+}

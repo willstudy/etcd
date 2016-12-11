@@ -60,6 +60,8 @@ func startEtcdOrProxyV2() {
 	grpc.EnableTracing = false
 
 	cfg := newConfig()
+	defaultInitialCluster := cfg.InitialCluster
+
 	err := cfg.parse(os.Args[1:])
 	if err != nil {
 		plog.Errorf("error verifying flags, %v. See 'etcd --help'.", err)
@@ -83,7 +85,9 @@ func startEtcdOrProxyV2() {
 	plog.Infof("setting maximum number of CPUs to %d, total number of available CPUs is %d", GoMaxProcs, runtime.NumCPU())
 
 	// TODO: check whether fields are set instead of whether fields have default value
-	if cfg.Name != embed.DefaultName && cfg.InitialCluster == cfg.InitialClusterFromName(embed.DefaultName) {
+	defaultHost, defaultHostErr := cfg.IsDefaultHost()
+	defaultHostOverride := defaultHost == "" || defaultHostErr == nil
+	if (defaultHostOverride || cfg.Name != embed.DefaultName) && cfg.InitialCluster == defaultInitialCluster {
 		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	}
 
@@ -163,7 +167,7 @@ func startEtcdOrProxyV2() {
 		// for accepting connections. The etcd instance should be
 		// joined with the cluster and ready to serve incoming
 		// connections.
-		sent, err := daemon.SdNotify("READY=1")
+		sent, err := daemon.SdNotify(false, "READY=1")
 		if err != nil {
 			plog.Errorf("failed to notify systemd for readiness: %v", err)
 		}
@@ -184,11 +188,21 @@ func startEtcdOrProxyV2() {
 
 // startEtcd runs StartEtcd in addition to hooks needed for standalone etcd.
 func startEtcd(cfg *embed.Config) (<-chan struct{}, <-chan error, error) {
+	defaultHost, dhErr := cfg.IsDefaultHost()
+	if defaultHost != "" {
+		if dhErr == nil {
+			plog.Infof("advertising using detected default host %q", defaultHost)
+		} else {
+			plog.Noticef("failed to detect default host, advertise falling back to %q (%v)", defaultHost, dhErr)
+		}
+	}
+
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
 	osutil.RegisterInterruptHandler(e.Server.Stop)
+	<-e.Server.ReadyNotify() // wait for e.Server to join the cluster
 	return e.Server.StopNotify(), e.Err(), nil
 }
 
@@ -258,15 +272,12 @@ func startProxy(cfg *config) error {
 	clientURLs := []string{}
 	uf := func() []string {
 		gcls, gerr := etcdserver.GetClusterFromRemotePeers(peerURLs, tr)
-		// TODO: remove the 2nd check when we fix GetClusterFromRemotePeers
-		// GetClusterFromRemotePeers should not return nil error with an invalid empty cluster
+
 		if gerr != nil {
 			plog.Warningf("proxy: %v", gerr)
 			return []string{}
 		}
-		if len(gcls.Members()) == 0 {
-			return clientURLs
-		}
+
 		clientURLs = gcls.ClientURLs()
 
 		urls := struct{ PeerURLs []string }{gcls.PeerURLs()}
@@ -380,6 +391,19 @@ func setupLogging(cfg *config) {
 			return
 		}
 		repoLog.SetLogLevel(settings)
+	}
+
+	// capnslog initially SetFormatter(NewDefaultFormatter(os.Stderr))
+	// where NewDefaultFormatter returns NewJournaldFormatter when syscall.Getppid() == 1
+	// specify 'stdout' or 'stderr' to skip journald logging even when running under systemd
+	switch cfg.logOutput {
+	case "stdout":
+		capnslog.SetFormatter(capnslog.NewPrettyFormatter(os.Stdout, cfg.Debug))
+	case "stderr":
+		capnslog.SetFormatter(capnslog.NewPrettyFormatter(os.Stderr, cfg.Debug))
+	case "default":
+	default:
+		plog.Panicf(`unknown log-output %q (only supports "default", "stdout", "stderr")`, cfg.logOutput)
 	}
 }
 
